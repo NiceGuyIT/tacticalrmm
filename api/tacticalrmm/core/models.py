@@ -1,9 +1,10 @@
 import smtplib
+import ssl
 import traceback
 from contextlib import suppress
 from email.headerregistry import Address
 from email.message import EmailMessage
-from email.utils import formatdate
+from email.utils import formatdate, make_msgid
 from typing import TYPE_CHECKING, List, Optional, cast
 
 import requests
@@ -21,11 +22,15 @@ from tacticalrmm.constants import (
     CORESETTINGS_CACHE_KEY,
     CustomFieldModel,
     CustomFieldType,
+    DarwinTerminalShellChoices,
     DebugLogLevel,
+    LinuxTerminalShellChoices,
     MonthlyType,
     ScheduleType,
+    TerminalModeChoices,
     URLActionRestMethod,
     URLActionType,
+    WindowsTerminalShellChoices,
 )
 from tacticalrmm.logger import logger
 
@@ -120,6 +125,38 @@ class CoreSettings(BaseAuditModel):
 
     block_local_user_logon = models.BooleanField(default=False)
     sso_enabled = models.BooleanField(default=False)
+
+    default_shell_windows = models.CharField(
+        max_length=32,
+        choices=WindowsTerminalShellChoices.choices,
+        default=WindowsTerminalShellChoices.CMD,
+    )
+    default_shell_windows_custom = models.CharField(
+        max_length=512, blank=True, default=""
+    )
+
+    default_shell_linux = models.CharField(
+        max_length=32,
+        choices=LinuxTerminalShellChoices.choices,
+        default=LinuxTerminalShellChoices.BASH,
+    )
+    default_shell_linux_custom = models.CharField(
+        max_length=512, blank=True, default=""
+    )
+
+    default_shell_darwin = models.CharField(
+        max_length=32,
+        choices=DarwinTerminalShellChoices.choices,
+        default=DarwinTerminalShellChoices.BASH,
+    )
+    default_shell_darwin_custom = models.CharField(
+        max_length=512, blank=True, default=""
+    )
+    terminal_mode = models.CharField(
+        max_length=20,
+        choices=TerminalModeChoices.choices,
+        default=TerminalModeChoices.NEW,
+    )
 
     def save(self, *args, **kwargs) -> None:
         from alerts.tasks import cache_agents_alert_template
@@ -275,6 +312,8 @@ class CoreSettings(BaseAuditModel):
 
             msg["Subject"] = subject
             msg["Date"] = formatdate(localtime=True)
+            # RFC 5322: Gmail rejects messages without a Message-ID
+            msg["Message-ID"] = make_msgid(domain=from_address.split("@")[-1])
 
             if self.smtp_from_name:
                 msg["From"] = Address(
@@ -315,10 +354,28 @@ class CoreSettings(BaseAuditModel):
                         filename=f"{attachment_filename}.{ext}",
                     )
 
-            with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=20) as server:
+            # Port 465 uses implicit TLS (SMTPS): the socket is wrapped in SSL
+            # the moment the connection is opened, so it must be created with
+            # smtplib.SMTP_SSL. Ports 587/25 open a plaintext connection that is
+            # upgraded in-band with STARTTLS.
+            use_ssl = self.smtp_port == 465
+            if use_ssl:
+                server: smtplib.SMTP = smtplib.SMTP_SSL(
+                    self.smtp_host,
+                    self.smtp_port,
+                    timeout=20,
+                    context=ssl.create_default_context(),
+                )
+            else:
+                server = smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=20)
+
+            with server:
                 if self.smtp_requires_auth:
                     server.ehlo()
-                    server.starttls()
+                    # STARTTLS only applies to a plaintext connection; on an
+                    # implicit-TLS (465) socket the channel is already encrypted.
+                    if not use_ssl:
+                        server.starttls()
                     server.login(
                         self.smtp_host_user,
                         self.smtp_host_password,
@@ -333,7 +390,7 @@ class CoreSettings(BaseAuditModel):
                         server.send_message(msg)
                         server.quit()
                     else:
-                        # smtp relay. no auth required
+                        # smtp relay. no auth required (implicit TLS when on 465)
                         server.send_message(msg)
                         server.quit()
 

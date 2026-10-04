@@ -206,8 +206,6 @@ if [ $? -ne 0 ]; then
 fi
 chmod +x ${agentBin}
 
-MESH_NODE_ID=""
-
 if [[ $NOMESH -eq 1 ]]; then
     echo "Skipping mesh install"
 else
@@ -216,16 +214,9 @@ else
     fi
     echo "Downloading and installing mesh agent..."
     InstallMesh
-    sleep 2
-    echo "Getting mesh node id..."
-    MESH_NODE_ID=$(env XAUTHORITY=foo DISPLAY=bar ${agentBin} -m nixmeshnodeid)
 fi
 
 INSTALL_CMD="${agentBin} -m install -api ${apiURL} -client-id ${clientID} -site-id ${siteID} -agent-type ${agentType} -auth ${token}"
-
-if [ "${MESH_NODE_ID}" != '' ]; then
-    INSTALL_CMD+=" --meshnodeid ${MESH_NODE_ID}"
-fi
 
 if [[ $DEBUG -eq 1 ]]; then
     INSTALL_CMD+=" --log debug"

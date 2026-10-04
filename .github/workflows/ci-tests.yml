@@ -14,11 +14,11 @@ jobs:
     name: Tests
     strategy:
       matrix:
-        python-version: ["3.11.8"]
+        python-version: ["3.12.13"]
 
     services:
       postgres:
-        image: postgres:15
+        image: postgres:18
         env:
           POSTGRES_DB: pipeline
           POSTGRES_USER: pipeline

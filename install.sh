@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 
-SCRIPT_VERSION="90"
+SCRIPT_VERSION="93"
 SCRIPT_URL="https://raw.githubusercontent.com/amidaware/tacticalrmm/master/install.sh"
 
-sudo apt install -y curl wget jq dirmngr gnupg lsb-release ca-certificates
-sudo apt install -y software-properties-common
 sudo apt update
-sudo apt install -y openssl
+sudo apt install -y curl wget jq lsb-release ca-certificates openssl
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -15,7 +13,7 @@ RED='\033[0;31m'
 NC='\033[0m'
 
 SCRIPTS_DIR='/opt/trmm-community-scripts'
-PYTHON_VER='3.11.8'
+PYTHON_VER='3.12.13'
 SETTINGS_FILE='/rmm/api/tacticalrmm/tacticalrmm/settings.py'
 local_settings='/rmm/api/tacticalrmm/tacticalrmm/local_settings.py'
 
@@ -67,19 +65,19 @@ relno=$(lsb_release -sr | cut -d. -f1)
 fullrelno=$(lsb_release -sr)
 
 not_supported() {
-  echo -ne "${RED}ERROR: Only Debian 11, Debian 12 and Ubuntu 22.04 are supported.${NC}\n"
+  echo -ne "${RED}ERROR: Only Debian 13 and Ubuntu 26.04 are supported.${NC}\n"
 }
 
 if [[ "$osname" == "debian" ]]; then
-  if [[ "$relno" -ne 11 && "$relno" -ne 12 ]]; then
+  [[ "$relno" -eq 13 ]] || {
     not_supported
     exit 1
-  fi
+  }
 elif [[ "$osname" == "ubuntu" ]]; then
-  if [[ "$fullrelno" != "22.04" ]]; then
+  [[ "$fullrelno" == "26.04" ]] || {
     not_supported
     exit 1
-  fi
+  }
 else
   not_supported
   exit 1
@@ -113,7 +111,6 @@ if [ "$arch" = "x86_64" ]; then
 else
   pgarch='arm64'
 fi
-postgresql_repo="deb [arch=${pgarch} signed-by=/etc/apt/keyrings/postgresql-archive-keyring.gpg] https://apt.postgresql.org/pub/repos/apt/ $codename-pgdg main"
 
 # prevents logging issues with some VPS providers like Vultr if this is a freshly provisioned instance that hasn't been rebooted yet
 sudo systemctl restart systemd-journald.service
@@ -148,6 +145,18 @@ print_yellow() {
 }
 
 cls
+
+fetch_key() {
+  if ! curl -fsSL "$1" | sudo tee "$2" >/dev/null; then
+    print_error "ERROR: failed to download signing key from $1"
+    exit 1
+  fi
+  if ! grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$2"; then
+    print_error "ERROR: $1 did not return an armored PGP key"
+    exit 1
+  fi
+  sudo chmod 644 "$2"
+}
 
 while [[ $rmmdomain != *[.]*[.]* ]]; do
   echo -ne "${YELLOW}Enter the subdomain for the backend (e.g. api.example.com)${NC}: "
@@ -249,9 +258,9 @@ else
   sudo apt install -y certbot
   print_green 'Getting wildcard cert'
 
-  sudo certbot certonly --manual -d *.${rootdomain} --agree-tos --no-bootstrap --preferred-challenges dns -m ${letsemail} --no-eff-email
+  sudo certbot certonly --manual -d *.${rootdomain} --agree-tos --preferred-challenges dns -m ${letsemail} --no-eff-email
   while [[ $? -ne 0 ]]; do
-    sudo certbot certonly --manual -d *.${rootdomain} --agree-tos --no-bootstrap --preferred-challenges dns -m ${letsemail} --no-eff-email
+    sudo certbot certonly --manual -d *.${rootdomain} --agree-tos --preferred-challenges dns -m ${letsemail} --no-eff-email
   done
   CERT_PRIV_KEY=/etc/letsencrypt/live/${rootdomain}/privkey.pem
   CERT_PUB_KEY=/etc/letsencrypt/live/${rootdomain}/fullchain.pem
@@ -262,14 +271,19 @@ print_green 'Installing Nginx'
 
 sudo mkdir -p /etc/apt/keyrings
 
-wget -qO - https://nginx.org/keys/nginx_signing.key | sudo gpg --dearmor -o /etc/apt/keyrings/nginx-archive-keyring.gpg
+fetch_key https://nginx.org/keys/nginx_signing.key /etc/apt/keyrings/nginx.asc
 
 nginxrepo="$(
   cat <<EOF
-deb [signed-by=/etc/apt/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/$osname $codename nginx
+Types: deb
+URIs: https://nginx.org/packages/${osname}
+Suites: ${codename}
+Components: nginx
+Signed-By: /etc/apt/keyrings/nginx.asc
 EOF
 )"
-echo "${nginxrepo}" | sudo tee /etc/apt/sources.list.d/nginx.list >/dev/null
+echo "${nginxrepo}" | sudo tee /etc/apt/sources.list.d/nginx.sources >/dev/null
+printf 'Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n' | sudo tee /etc/apt/preferences.d/99nginx >/dev/null
 
 sudo apt update
 sudo apt install -y nginx
@@ -314,9 +328,20 @@ done
 
 print_green 'Installing NodeJS'
 
-curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
-NODE_MAJOR=20
-echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_$NODE_MAJOR.x nodistro main" | sudo tee /etc/apt/sources.list.d/nodesource.list
+NODE_MAJOR=24
+fetch_key https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key /etc/apt/keyrings/nodesource.asc
+
+noderepo="$(
+  cat <<EOF
+Types: deb
+URIs: https://deb.nodesource.com/node_${NODE_MAJOR}.x
+Suites: nodistro
+Components: main
+Signed-By: /etc/apt/keyrings/nodesource.asc
+EOF
+)"
+echo "${noderepo}" | sudo tee /etc/apt/sources.list.d/nodesource.sources >/dev/null
+
 sudo apt update
 sudo apt install -y gcc g++ make
 sudo apt install -y nodejs
@@ -324,7 +349,7 @@ sudo npm install -g npm
 
 print_green "Installing Python ${PYTHON_VER}"
 
-sudo apt install -y build-essential zlib1g-dev libncurses5-dev libgdbm-dev libnss3-dev libssl-dev libreadline-dev libffi-dev libsqlite3-dev libbz2-dev
+sudo apt install -y build-essential zlib1g-dev libncurses-dev libgdbm-dev libnss3-dev libssl-dev libreadline-dev libffi-dev libsqlite3-dev libbz2-dev
 numprocs=$(nproc)
 cd ~
 wget https://www.python.org/ftp/python/${PYTHON_VER}/Python-${PYTHON_VER}.tgz
@@ -341,11 +366,22 @@ sudo apt install -y redis git
 
 print_green 'Installing postgresql'
 
-echo "$postgresql_repo" | sudo tee /etc/apt/sources.list.d/pgdg.list
+fetch_key https://www.postgresql.org/media/keys/ACCC4CF8.asc /etc/apt/keyrings/postgresql.asc
 
-wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/keyrings/postgresql-archive-keyring.gpg
+pgrepo="$(
+  cat <<EOF
+Types: deb
+URIs: https://apt.postgresql.org/pub/repos/apt
+Suites: ${codename}-pgdg
+Components: main
+Architectures: ${pgarch}
+Signed-By: /etc/apt/keyrings/postgresql.asc
+EOF
+)"
+echo "${pgrepo}" | sudo tee /etc/apt/sources.list.d/pgdg.sources >/dev/null
+
 sudo apt update
-sudo apt install -y postgresql-15
+sudo apt install -y postgresql-18
 sleep 2
 sudo systemctl enable --now postgresql
 
@@ -428,9 +464,8 @@ mesh_pkg="$(
   "dependencies": {
     "archiver": "7.0.1",
     "meshcentral": "${MESH_VER}",
-    "otplib": "10.2.3",
-    "pg": "8.7.1",
-    "pgtools": "0.3.2"
+    "otplib": "13.4.1",
+    "pg": "8.16.3"
   }
 }
 EOF
@@ -457,6 +492,7 @@ meshcfg="$(
     "wsCompression": false,
     "agentWsCompression": false,
     "maxInvalidLogin": { "time": 5, "count": 5, "coolofftime": 30 },
+	"autoBackup": false,
     "postgres": {
       "user": "${MESHPGUSER}",
       "password": "${MESHPGPWD}",
@@ -561,7 +597,7 @@ sudo mkdir -p /opt/tactical/reporting/schemas
 sudo chown -R ${USER}:${USER} /opt/tactical
 
 cd /rmm/api
-python3.11 -m venv env
+python3.12 -m venv env
 source /rmm/api/env/bin/activate
 cd /rmm/api/tacticalrmm
 pip install --no-cache-dir pip==25.1
@@ -915,11 +951,11 @@ echo "${meshservice}" | sudo tee /etc/systemd/system/meshcentral.service >/dev/n
 sudo systemctl daemon-reload
 
 if [ -d ~/.npm ]; then
-  sudo chown -R $USER:$GROUP ~/.npm
+  sudo chown -R $USER:$USER ~/.npm
 fi
 
 if [ -d ~/.config ]; then
-  sudo chown -R $USER:$GROUP ~/.config
+  sudo chown -R $USER:$USER ~/.config
 fi
 
 print_green 'Installing the frontend'

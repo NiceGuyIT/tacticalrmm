@@ -21,6 +21,9 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from agents.utils import get_agent_url
+from core.models import CoreSettings
+from core.permissions import RunServerScriptPerms
 from core.tasks import sync_mesh_perms_task
 from core.utils import (
     get_core_settings,
@@ -33,12 +36,16 @@ from logs.models import AuditLog, DebugLog, PendingAction
 from scripts.models import Script
 from scripts.tasks import bulk_command_task, bulk_script_task
 from tacticalrmm.constants import (
+    AGENT_DARWIN_SHELL_TOKENS,
     AGENT_DEFER,
+    AGENT_LINUX_SHELL_TOKENS,
     AGENT_STATUS_OFFLINE,
     AGENT_STATUS_ONLINE,
+    AGENT_WINDOWS_SHELL_TOKENS,
     AgentHistoryType,
     AgentMonType,
     AgentPlat,
+    AgentTerminalShellChoices,
     CustomFieldModel,
     DebugLogType,
     EvtLogNames,
@@ -46,6 +53,7 @@ from tacticalrmm.constants import (
     PAStatus,
 )
 from tacticalrmm.helpers import date_is_in_past, notify_error
+from tacticalrmm.pagination import StandardPagination
 from tacticalrmm.permissions import (
     _has_perm_on_agent,
     _has_perm_on_client,
@@ -62,6 +70,7 @@ from .permissions import (
     AgentNotesPerms,
     AgentPerms,
     AgentRegistryPerms,
+    AgentTerminalPerms,
     AgentWOLPerms,
     EvtLogPerms,
     InstallAgentPerms,
@@ -81,6 +90,7 @@ from .serializers import (
     AgentNoteSerializer,
     AgentSerializer,
     AgentTableSerializer,
+    AgentTerminalDefaultsSerializer,
 )
 from .tasks import (
     bulk_recover_agents_task,
@@ -169,6 +179,53 @@ class GetUpdateDeleteAgent(APIView):
     permission_classes = [IsAuthenticated, AgentPerms]
 
     class InputSerializer(serializers.ModelSerializer):
+        def validate(self, attrs):
+            agent = self.instance
+            shell = attrs.get("default_shell", getattr(agent, "default_shell", None))
+            custom = attrs.get(
+                "default_shell_custom", getattr(agent, "default_shell_custom", "")
+            )
+
+            shell = (shell or "").strip().lower()
+            custom = (custom or "").strip()
+
+            if shell in ("", "none", "null"):
+                shell = AgentTerminalShellChoices.USE_GLOBAL
+                attrs["default_shell"] = AgentTerminalShellChoices.USE_GLOBAL
+
+            if agent.plat == AgentPlat.WINDOWS:
+                allowed = AGENT_WINDOWS_SHELL_TOKENS
+                msg = (
+                    "Invalid default shell for Windows agent. "
+                    "Use global default, 'cmd', 'powershell' or 'custom'."
+                )
+            elif agent.plat == AgentPlat.LINUX:
+                allowed = AGENT_LINUX_SHELL_TOKENS
+                msg = (
+                    "Invalid default shell for Linux agent. "
+                    "Use global default, 'bash' or 'custom'."
+                )
+            elif agent.plat == AgentPlat.DARWIN:
+                allowed = AGENT_DARWIN_SHELL_TOKENS
+                msg = (
+                    "Invalid default shell for macOS agent. "
+                    "Use global default, 'bash' or 'custom'."
+                )
+            else:
+                allowed = {AgentTerminalShellChoices.USE_GLOBAL}
+                msg = "Invalid default shell for this agent OS."
+
+            if shell not in allowed:
+                raise serializers.ValidationError({"default_shell": msg})
+
+            if shell == AgentTerminalShellChoices.CUSTOM and not custom:
+                raise serializers.ValidationError(
+                    {"default_shell_custom": "Custom shell path must be provided."}
+                )
+
+            attrs["default_shell"] = shell
+            return attrs
+
         class Meta:
             model = Agent
             fields = [
@@ -185,6 +242,8 @@ class GetUpdateDeleteAgent(APIView):
                 "check_interval",
                 "time_zone",
                 "site",
+                "default_shell",
+                "default_shell_custom",
             ]
 
     # get agent details
@@ -356,7 +415,7 @@ class WebVNC(APIView):
             + "%2F"
             + "meshrelay.ashx%3Fauth%3D"
             + cookie_ret["cookie"]  # type: ignore
-            + f"&show_dot=1&l=en&name={agent.hostname}"
+            + f"&show_dot=1&l=en&resize=scale&name={agent.hostname}"
         )
 
         ret = {
@@ -633,7 +692,6 @@ def install_agent(request):
     from knox.models import AuthToken
 
     from accounts.models import User
-    from agents.utils import get_agent_url
     from core.utils import token_is_valid
 
     insecure = getattr(settings, "TRMM_INSECURE", False)
@@ -733,7 +791,7 @@ def install_agent(request):
                 "ping",
                 "127.0.0.1",
                 "-n",
-                "5",
+                "7",
                 "&&",
                 r'"C:\Program Files\TacticalAgent\tacticalrmm.exe"',
             ] + install_flags
@@ -798,7 +856,11 @@ def recover(request, agent_id: str) -> Response:
 
     if mode == "tacagent":
         uri = get_mesh_ws_url()
-        agent.recover(mode, uri, wait=False)
+        code_token, _ = token_is_valid()
+        agent_url = get_agent_url(
+            goarch=agent.goarch, plat=agent.plat, token=code_token
+        )
+        agent.recover(mode, uri, wait=False, agent_url=agent_url)
         return Response("Recovery will be attempted shortly")
 
     elif mode == "mesh":
@@ -821,8 +883,12 @@ def run_script(request, agent_id):
     req_timeout = int(request.data["timeout"]) + 3
     run_on_server: bool | None = request.data.get("run_on_server")
 
-    if run_on_server and not get_core_settings().server_scripts_enabled:
-        return notify_error("This feature is disabled.")
+    if run_on_server:
+        if not get_core_settings().server_scripts_enabled:
+            return notify_error("This feature is disabled.")
+
+        if not RunServerScriptPerms().has_permission(request, None):
+            raise PermissionDenied()
 
     AuditLog.audit_script_run(
         username=request.user.username,
@@ -1178,6 +1244,8 @@ class WMI(APIView):
 
 
 class AgentHistoryView(APIView):
+    # TODO deprecated
+
     permission_classes = [IsAuthenticated, AgentHistoryPerms]
 
     def get(self, request, agent_id=None):
@@ -1188,6 +1256,30 @@ class AgentHistoryView(APIView):
             history = AgentHistory.objects.filter_by_role(request.user)  # type: ignore
         ctx = {"default_tz": get_default_timezone()}
         return Response(AgentHistorySerializer(history, many=True, context=ctx).data)
+
+
+class AgentHistoryViewV2(APIView):
+    permission_classes = [IsAuthenticated, AgentHistoryPerms]
+    ordering_fields = ("time", "type", "command", "username")
+
+    def get(self, request, agent_id=None):
+        if agent_id:
+            agent = get_object_or_404(Agent, agent_id=agent_id)
+            history = AgentHistory.objects.filter(agent=agent)
+        else:
+            history = AgentHistory.objects.filter_by_role(request.user)  # type: ignore
+
+        ordering = request.query_params.get("ordering", "-time")
+        if ordering.lstrip("-") not in self.ordering_fields:
+            ordering = "-time"
+        # id as tiebreaker so rows never shift between pages
+        history = history.select_related("script").order_by(ordering, "-id")
+
+        paginator = StandardPagination()
+        page = paginator.paginate_queryset(history, request, view=self)
+        ctx = {"default_tz": get_default_timezone()}
+        serializer = AgentHistorySerializer(page, many=True, context=ctx)
+        return paginator.get_paginated_response(serializer.data)
 
 
 class ScriptRunHistory(APIView):
@@ -1553,3 +1645,28 @@ def modify_registry_value(request, agent_id):
             },
         }
     )
+
+
+class AgentTerminalDefaults(APIView):
+    permission_classes = [IsAuthenticated, AgentTerminalPerms]
+
+    def get(self, request, agent_id):
+        agent = get_object_or_404(
+            Agent.objects.filter_by_role(request.user).defer(*AGENT_DEFER),
+            agent_id=agent_id,
+        )
+
+        supports_new_terminal = True
+        if pyver.parse(agent.version) < pyver.parse("2.11.0"):
+            supports_new_terminal = False
+
+        core_settings = CoreSettings.objects.only("terminal_mode").first()
+        return Response(
+            AgentTerminalDefaultsSerializer(
+                agent,
+                context={
+                    "core_settings": core_settings,
+                    "supports_new_terminal": supports_new_terminal,
+                },
+            ).data
+        )

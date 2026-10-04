@@ -23,21 +23,21 @@ MAC_UNINSTALL = BASE_DIR / "core" / "mac_uninstall.sh"
 AUTH_USER_MODEL = "accounts.User"
 
 # latest release
-TRMM_VERSION = "1.4.0"
+TRMM_VERSION = "1.5.3-dev"
 
 # https://github.com/amidaware/tacticalrmm-web
-WEB_VERSION = "0.101.59"
+WEB_VERSION = "0.101.64"
 
 # bump this version everytime vue code is changed
 # to alert user they need to manually refresh their browser
-APP_VER = "0.0.202"
+APP_VER = "0.0.203"
 
 # https://github.com/amidaware/rmmagent
-LATEST_AGENT_VER = "2.10.0"
+LATEST_AGENT_VER = "2.11.0"
 
-MESH_VER = "1.1.32"
+MESH_VER = "1.2.5"
 
-NATS_SERVER_VER = "2.12.3"
+NATS_SERVER_VER = "2.15.0"
 
 # Install Nushell on the agent
 # https://github.com/nushell/nushell
@@ -45,7 +45,7 @@ INSTALL_NUSHELL = True
 # GitHub version to download. The file will be downloaded from GitHub, extracted and installed.
 # Version to download. If INSTALL_NUSHELL_URL is not provided, the file will be downloaded from GitHub,
 # extracted and installed.
-INSTALL_NUSHELL_VERSION = "0.109.1"
+INSTALL_NUSHELL_VERSION = "0.115.1"
 # URL to download directly. This is expected to be the direct URL, unauthenticated, uncompressed, ready to be installed.
 # Use {OS}, {ARCH} and {VERSION} to specify the GOOS, GOARCH and INSTALL_NUSHELL_VERSION respectively.
 # Windows: The ".exe" extension will be added automatically.
@@ -83,10 +83,10 @@ INSTALL_DENO_URL = ""
 DENO_DEFAULT_PERMISSIONS = "--allow-all"
 
 # for the update script, bump when need to recreate venv
-PIP_VER = "48"
+PIP_VER = "49"
 
-SETUPTOOLS_VER = "80.9.0"
-WHEEL_VER = "0.45.1"
+SETUPTOOLS_VER = "83.0.0"
+WHEEL_VER = "0.47.0"
 
 AGENT_BASE_URL = "https://agents.tacticalrmm.com"
 
@@ -120,6 +120,10 @@ TRMM_LOG_LEVEL = "ERROR"
 TRMM_LOG_TO = "file"
 TRMM_PROTO = "https"
 TRMM_BACKEND_PORT = None
+TRMM_CHECK_CREDS_MIN_THROTTLE = 10
+TRMM_CHECK_CREDS_DAY_THROTTLE = 300
+TRMM_LOGIN_MIN_THROTTLE = 10
+TRMM_LOGIN_DAY_THROTTLE = 300
 
 if not DOCKER_BUILD:
     ALLOWED_HOSTS = []
@@ -189,10 +193,10 @@ REST_FRAMEWORK = {
     ),
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "DEFAULT_THROTTLE_RATES": {
-        "check_creds_min": "50/minute",
-        "login_min": "50/minute",
-        "check_creds_day": "1000/day",
-        "login_day": "1000/day",
+        "check_creds_min": f"{TRMM_CHECK_CREDS_MIN_THROTTLE}/minute",
+        "login_min": f"{TRMM_LOGIN_MIN_THROTTLE}/minute",
+        "check_creds_day": f"{TRMM_CHECK_CREDS_DAY_THROTTLE}/day",
+        "login_day": f"{TRMM_LOGIN_DAY_THROTTLE}/day",
     },
 }
 

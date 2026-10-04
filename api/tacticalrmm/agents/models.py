@@ -19,7 +19,13 @@ from nats.errors import TimeoutError
 from packaging import version as pyver
 from packaging.version import Version as LooseVersion
 
-from agents.utils import calculate_agent_checks, get_agent_url
+from agents.utils import (
+    calculate_agent_checks,
+    get_agent_url,
+    is_posix_abs_path,
+    is_windows_path,
+    strip_relation_caches_for_cache,
+)
 from core.models import TZ_CHOICES
 from core.utils import _b64_to_hex, get_core_settings, send_command_with_mesh
 from logs.models import BaseAuditModel, DebugLog, PendingAction
@@ -28,15 +34,20 @@ from tacticalrmm.constants import (
     AGENT_STATUS_ONLINE,
     AGENT_STATUS_OVERDUE,
     AGENT_TBL_PEND_ACTION_CNT_CACHE_PREFIX,
+    DARWIN_TOKENS,
+    LINUX_TOKENS,
     ONLINE_AGENTS,
+    WINDOWS_TOKENS,
     AgentHistoryType,
     AgentMonType,
     AgentPlat,
+    AgentTerminalShellChoices,
     CustomFieldType,
     DebugLogType,
     GoArch,
     PAAction,
     PAStatus,
+    TerminalShellChoices,
 )
 from tacticalrmm.helpers import has_script_actions, has_webhook, setup_nats_options
 from tacticalrmm.models import PermissionQuerySet
@@ -119,6 +130,18 @@ class Agent(BaseAuditModel):
         null=True,
         blank=True,
         on_delete=models.SET_NULL,
+    )
+
+    default_shell = models.CharField(
+        max_length=32,
+        choices=AgentTerminalShellChoices.choices,
+        default=AgentTerminalShellChoices.USE_GLOBAL,
+    )
+
+    default_shell_custom = models.CharField(
+        max_length=512,
+        blank=True,
+        default="",
     )
 
     def __str__(self) -> str:
@@ -235,6 +258,83 @@ class Agent(BaseAuditModel):
                 return AGENT_STATUS_ONLINE
         else:
             return AGENT_STATUS_OFFLINE
+
+    @property
+    def effective_default_shell(self) -> str:
+        """
+        Final shell string used to launch the real-time terminal.
+
+        Windows:
+          - "cmd" | "powershell" | absolute Windows path
+
+        Linux/macOS:
+          - "bash" | absolute POSIX path
+        """
+
+        def clean(v) -> str:
+            return (v or "").strip()
+
+        if self.default_shell == AgentTerminalShellChoices.CUSTOM:
+            v = clean(self.default_shell_custom)
+            if self.plat == AgentPlat.WINDOWS:
+                return v if (v and is_windows_path(v)) else "cmd"
+            if self.plat in {AgentPlat.LINUX, AgentPlat.DARWIN}:
+                return v if (v and is_posix_abs_path(v)) else "bash"
+            return "cmd"
+
+        if (
+            self.default_shell
+            and self.default_shell != AgentTerminalShellChoices.USE_GLOBAL
+        ):
+            # token override only (cmd/powershell/bash)
+            shell = clean(self.default_shell).lower()
+            if self.plat == AgentPlat.WINDOWS:
+                return shell if shell in WINDOWS_TOKENS else "cmd"
+            if self.plat == AgentPlat.LINUX:
+                return shell if shell in LINUX_TOKENS else "bash"
+            if self.plat == AgentPlat.DARWIN:
+                return shell if shell in DARWIN_TOKENS else "bash"
+            return "cmd"
+
+        try:
+            core = get_core_settings()
+        except Exception:
+            core = None
+
+        if not core:
+            return "cmd" if self.plat == AgentPlat.WINDOWS else "bash"
+
+        if self.plat == AgentPlat.WINDOWS:
+            if core.default_shell_windows == TerminalShellChoices.CUSTOM:
+                v = clean(core.default_shell_windows_custom)
+                return v if (v and is_windows_path(v)) else "cmd"
+            shell = clean(core.default_shell_windows).lower()
+            return shell if shell in WINDOWS_TOKENS else "cmd"
+
+        if self.plat == AgentPlat.LINUX:
+            if core.default_shell_linux == TerminalShellChoices.CUSTOM:
+                v = clean(core.default_shell_linux_custom)
+                return v if (v and is_posix_abs_path(v)) else "bash"
+            shell = clean(core.default_shell_linux).lower()
+            return shell if shell in LINUX_TOKENS else "bash"
+
+        if self.plat == AgentPlat.DARWIN:
+            if core.default_shell_darwin == TerminalShellChoices.CUSTOM:
+                v = clean(core.default_shell_darwin_custom)
+                return v if (v and is_posix_abs_path(v)) else "bash"
+            shell = clean(core.default_shell_darwin).lower()
+            return shell if shell in DARWIN_TOKENS else "bash"
+
+        return "cmd"
+
+    @property
+    def resolved_default_shell(self):
+        effective_shell = (self.effective_default_shell or "").strip().lower()
+        builtin_shells = {"cmd", "powershell", "bash"}
+        if effective_shell in builtin_shells:
+            return effective_shell
+
+        return "custom"
 
     @property
     def checks(self) -> Dict[str, Any]:
@@ -485,6 +585,7 @@ class Agent(BaseAuditModel):
 
     def get_agent_policies(self) -> "Dict[str, Optional[Policy]]":
         from checks.models import Check
+        from clients.models import Client, Site
 
         site_policy = getattr(self.site, f"{self.monitoring_type}_policy", None)
         client_policy = getattr(self.client, f"{self.monitoring_type}_policy", None)
@@ -492,16 +593,19 @@ class Agent(BaseAuditModel):
             get_core_settings(), f"{self.monitoring_type}_policy", None
         )
 
-        # prefetch excluded objects on polices only if policy is not Non
+        # prefetch excluded objects on polices only if policy is not None
+        # exclusions are only ever checked by pk (is_agent_excluded), so don't
+        # load full rows; a policy with many excluded agents would otherwise
+        # drag every excluded agent's wmi_detail/services into memory
         models.prefetch_related_objects(
             [
                 policy
                 for policy in (self.policy, site_policy, client_policy, default_policy)
                 if policy
             ],
-            "excluded_agents",
-            "excluded_sites",
-            "excluded_clients",
+            models.Prefetch("excluded_agents", queryset=Agent.objects.only("pk")),
+            models.Prefetch("excluded_sites", queryset=Site.objects.only("pk")),
+            models.Prefetch("excluded_clients", queryset=Client.objects.only("pk")),
             models.Prefetch(
                 "policychecks", queryset=Check.objects.select_related("script")
             ),
@@ -788,7 +892,7 @@ class Agent(BaseAuditModel):
             self.agentchecks.update(overridden_by_policy=False)  # type: ignore
 
             # get agent checks based on policies
-            checks = Policy.get_policy_checks(self)
+            checks = strip_relation_caches_for_cache(Policy.get_policy_checks(self))
             cache.set(cache_key, checks, 600)
             return checks
 
@@ -810,7 +914,7 @@ class Agent(BaseAuditModel):
             return cached_tasks
         else:
             # get agent tasks based on policies
-            tasks = Policy.get_policy_tasks(self)
+            tasks = strip_relation_caches_for_cache(Policy.get_policy_tasks(self))
             cache.set(cache_key, tasks, 600)
             return tasks
 
@@ -959,7 +1063,9 @@ class Agent(BaseAuditModel):
                     "NATS close failed for agent %s", self.agent_id, exc_info=True
                 )
 
-    def recover(self, mode: str, mesh_uri: str, wait: bool = True) -> tuple[str, bool]:
+    def recover(
+        self, mode: str, mesh_uri: str, wait: bool = True, agent_url: str = ""
+    ) -> tuple[str, bool]:
         """
         Return type: tuple(message: str, error: bool)
         """
@@ -971,8 +1077,15 @@ class Agent(BaseAuditModel):
                 cmd = "launchctl kickstart -k system/tacticalagent"
                 shell = 3
             else:
-                cmd = "net stop tacticalrmm & taskkill /F /IM tacticalrmm.exe & net start tacticalrmm"
-                shell = 1
+                bin = f"tacticalagent-v{settings.LATEST_AGENT_VER}-{self.plat}-{self.goarch}.exe"
+                cmd = (
+                    f"$url='{agent_url}';"
+                    r"$destDir=Join-Path $env:ProgramData 'TacticalRMM';"
+                    f"$fileName='{bin}';"
+                    r"$fullPath=Join-Path $destDir $fileName;"
+                    r"Invoke-WebRequest -Uri $url -OutFile $fullPath; Start-Process -FilePath $fullPath -ArgumentList '/VERYSILENT' -Wait"
+                )
+                shell = 2
 
             asyncio.run(
                 send_command_with_mesh(cmd, mesh_uri, self.mesh_node_id, shell, 0)
@@ -982,7 +1095,7 @@ class Agent(BaseAuditModel):
         elif mode == "mesh":
             data = {"func": "recover", "payload": {"mode": mode}}
             if wait:
-                r = asyncio.run(self.nats_cmd(data, timeout=20))
+                r = asyncio.run(self.nats_cmd(data, timeout=60))
                 if r == "ok":
                     return "ok", False
                 else:
